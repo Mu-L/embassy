@@ -6,11 +6,11 @@ use core::hint::black_box;
 use defmt::{error, info, warn};
 use defmt_rtt as _;
 use elliptic_curve::group::Group;
-use elliptic_curve::ops::{Invert, LinearCombination, MulByGenerator, Reduce};
+use elliptic_curve::ops::{Invert, LinearCombination, Reduce};
 use elliptic_curve::pkcs8::{AssociatedOid, ObjectIdentifier};
-use elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use elliptic_curve::sec1::{FromSec1Point, ModulusSize, ToSec1Point};
 use elliptic_curve::subtle::ConstantTimeEq;
-use elliptic_curve::{Curve, CurveArithmetic, FieldBytes, FieldBytesSize, PublicKey, Scalar, SecretKey, ecdh};
+use elliptic_curve::{CurveArithmetic, FieldBytes, FieldBytesSize, PublicKey, Scalar, SecretKey, ecdh};
 use embassy_executor::Spawner;
 use embassy_time::Instant;
 use panic_probe as _;
@@ -158,7 +158,7 @@ pub fn verify_p256<C>() -> Result<(), &'static str>
 where
     C: CurveArithmetic + AssociatedOid,
     FieldBytesSize<C>: ModulusSize,
-    C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
+    C::AffinePoint: FromSec1Point<C> + ToSec1Point<C>,
 {
     if <C as AssociatedOid>::OID != P256_OID {
         return Err("OID mismatch: not secp256r1");
@@ -169,14 +169,14 @@ where
     }
 
     let g = PublicKey::<C>::from_sec1_bytes(&P256_G_UNCOMPRESSED).map_err(|_| "P-256 base point encoding rejected")?;
-    if g.to_encoded_point(true).as_bytes() != P256_G_COMPRESSED {
+    if g.to_sec1_point(true).as_bytes() != P256_G_COMPRESSED {
         return Err("base point does not match P-256 generator (compressed)");
     }
-    if g.to_encoded_point(false).as_bytes() != P256_G_UNCOMPRESSED {
+    if g.to_sec1_point(false).as_bytes() != P256_G_UNCOMPRESSED {
         return Err("base point does not match P-256 generator (uncompressed)");
     }
 
-    let n = Scalar::<C>::reduce(<C as Curve>::ORDER);
+    let n = <C::Scalar as Reduce<C::Uint>>::reduce(C::ORDER.as_ref());
     let generator: C::ProjectivePoint = Group::generator();
     let identity: C::ProjectivePoint = Group::identity();
     if !bool::from((generator * n).ct_eq(&identity)) {
@@ -213,7 +213,7 @@ pub fn benchmark_p256<C>(cfg: BenchConfig, tag: &str) -> Timings
 where
     C: CurveArithmetic,
     FieldBytesSize<C>: ModulusSize,
-    C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
+    C::AffinePoint: FromSec1Point<C> + ToSec1Point<C>,
 {
     let bench_start = Instant::now();
 
@@ -303,12 +303,10 @@ where
     let start = Instant::now();
     for i in 0..rounds {
         let j = (i as usize) & 7;
-        let r = C::ProjectivePoint::lincomb(
-            &generator,
-            black_box(&scalars[j]),
-            black_box(&peer_point),
-            black_box(&scalars[(j + 3) & 7]),
-        );
+        let r = C::ProjectivePoint::lincomb(&[
+            (generator, *black_box(&scalars[j])),
+            (peer_point, *black_box(&scalars[(j + 3) & 7])),
+        ]);
         acc = acc + r;
     }
     black_box(&acc);
@@ -367,7 +365,7 @@ pub fn verify_and_benchmark<C>(cfg: BenchConfig, tag: &str) -> Option<Timings>
 where
     C: CurveArithmetic + AssociatedOid,
     FieldBytesSize<C>: ModulusSize,
-    C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
+    C::AffinePoint: FromSec1Point<C> + ToSec1Point<C>,
 {
     match verify_p256::<C>() {
         Ok(()) => Some(benchmark_p256::<C>(cfg, tag)),

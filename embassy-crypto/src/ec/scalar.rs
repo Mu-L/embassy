@@ -7,15 +7,19 @@ use core::fmt;
 use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Shr, ShrAssign, Sub, SubAssign};
 
+use elliptic_curve::bigint::RandomMod;
+use elliptic_curve::bigint::ctutils::{CtEq, CtSelect};
+use elliptic_curve::bigint::modular::Retrieve;
+use elliptic_curve::common::Generate;
 use elliptic_curve::ff::{Field, PrimeField};
-use elliptic_curve::ops::{Invert, Reduce, ReduceNonZero};
-use elliptic_curve::rand_core::RngCore;
+use elliptic_curve::ops::{Invert, MulVartime, Reduce, ReduceNonZero};
+use elliptic_curve::rand_core::{TryCryptoRng, TryRng};
 use elliptic_curve::scalar::{FromUintUnchecked, IsHigh};
 use elliptic_curve::subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 use elliptic_curve::zeroize::DefaultIsZeroes;
-use elliptic_curve::{FieldBytes, ScalarPrimitive, SecretKey};
+use elliptic_curve::{FieldBytes, ScalarValue, SecretKey};
 
-use super::{Accelerated, Backend};
+use super::{Accelerated, AffinePoint, Backend, ProjectivePoint};
 
 /// Scalar field element modulo the curve order.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -56,8 +60,8 @@ impl<C: Backend> Field for Scalar<C> {
     const ZERO: Self = Self(<C::Scalar as Field>::ZERO);
     const ONE: Self = Self(<C::Scalar as Field>::ONE);
 
-    fn random(rng: impl RngCore) -> Self {
-        Self(<C::Scalar as Field>::random(rng))
+    fn try_random<R: TryRng + ?Sized>(rng: &mut R) -> Result<Self, R::Error> {
+        <C::Scalar as Field>::try_random(rng).map(Self)
     }
 
     fn is_zero(&self) -> Choice {
@@ -180,9 +184,10 @@ impl<C: Backend> IsHigh for Scalar<C> {
 impl<C: Backend> Shr<usize> for Scalar<C> {
     type Output = Self;
 
-    fn shr(mut self, rhs: usize) -> Self {
-        self.0 >>= rhs;
-        self
+    fn shr(self, rhs: usize) -> Self {
+        let mut s = self;
+        s >>= rhs;
+        s
     }
 }
 
@@ -196,7 +201,9 @@ impl<C: Backend> Shr<usize> for &Scalar<C> {
 
 impl<C: Backend> ShrAssign<usize> for Scalar<C> {
     fn shr_assign(&mut self, rhs: usize) {
-        self.0 >>= rhs;
+        let mut uint = C::Uint::from(&*self);
+        uint >>= rhs;
+        *self = Self::from_uint_unchecked(uint);
     }
 }
 
@@ -230,27 +237,27 @@ impl<C: Backend> From<&Scalar<C>> for FieldBytes<C> {
     }
 }
 
-impl<C: Backend> From<ScalarPrimitive<Accelerated<C>>> for Scalar<C> {
-    fn from(w: ScalarPrimitive<Accelerated<C>>) -> Self {
+impl<C: Backend> From<ScalarValue<Accelerated<C>>> for Scalar<C> {
+    fn from(w: ScalarValue<Accelerated<C>>) -> Self {
         Self::from(&w)
     }
 }
 
-impl<C: Backend> From<&ScalarPrimitive<Accelerated<C>>> for Scalar<C> {
-    fn from(w: &ScalarPrimitive<Accelerated<C>>) -> Self {
+impl<C: Backend> From<&ScalarValue<Accelerated<C>>> for Scalar<C> {
+    fn from(w: &ScalarValue<Accelerated<C>>) -> Self {
         Self::from_uint_unchecked(*w.as_uint())
     }
 }
 
-impl<C: Backend> From<Scalar<C>> for ScalarPrimitive<Accelerated<C>> {
+impl<C: Backend> From<Scalar<C>> for ScalarValue<Accelerated<C>> {
     fn from(scalar: Scalar<C>) -> Self {
         Self::from(&scalar)
     }
 }
 
-impl<C: Backend> From<&Scalar<C>> for ScalarPrimitive<Accelerated<C>> {
+impl<C: Backend> From<&Scalar<C>> for ScalarValue<Accelerated<C>> {
     fn from(scalar: &Scalar<C>) -> Self {
-        ScalarPrimitive::from_uint_unchecked(C::Uint::from(scalar))
+        ScalarValue::from_uint_unchecked(C::Uint::from(scalar))
     }
 }
 
@@ -384,15 +391,12 @@ impl<C: Backend> Neg for &Scalar<C> {
     }
 }
 
-impl<C: Backend> Reduce<C::Uint> for Scalar<C> {
-    type Bytes = FieldBytes<C>;
-
-    fn reduce(n: C::Uint) -> Self {
-        Self(<C::Scalar as Reduce<C::Uint>>::reduce(n))
-    }
-
-    fn reduce_bytes(bytes: &FieldBytes<C>) -> Self {
-        Self(<C::Scalar as Reduce<C::Uint>>::reduce_bytes(bytes))
+impl<C: Backend, T> Reduce<T> for Scalar<C>
+where
+    C::Scalar: Reduce<T>,
+{
+    fn reduce(n: &T) -> Self {
+        Self(<C::Scalar as Reduce<T>>::reduce(n))
     }
 }
 
@@ -403,12 +407,8 @@ impl<C: Backend> Reduce<C::Uint> for Scalar<C> {
 // `Reduce`). Curves with a native impl override the backend method to keep
 // it unchanged.
 impl<C: Backend> ReduceNonZero<C::Uint> for Scalar<C> {
-    fn reduce_nonzero(n: C::Uint) -> Self {
+    fn reduce_nonzero(n: &C::Uint) -> Self {
         Self(C::reduce_nonzero(n))
-    }
-
-    fn reduce_nonzero_bytes(bytes: &FieldBytes<C>) -> Self {
-        Self(C::reduce_nonzero_bytes(bytes))
     }
 }
 
@@ -444,6 +444,79 @@ impl<C: Backend> ConditionallySelectable for Scalar<C> {
 
 impl<C: Backend> ConstantTimeEq for Scalar<C> {
     fn ct_eq(&self, other: &Self) -> Choice {
-        self.0.ct_eq(&other.0)
+        ConstantTimeEq::ct_eq(&self.0, &other.0)
     }
 }
+
+impl<C: Backend> CtEq for Scalar<C> {
+    fn ct_eq(&self, other: &Self) -> elliptic_curve::bigint::Choice {
+        CtEq::ct_eq(&self.0, &other.0)
+    }
+}
+
+impl<C: Backend> CtSelect for Scalar<C> {
+    fn ct_select(&self, other: &Self, choice: elliptic_curve::bigint::Choice) -> Self {
+        Self(CtSelect::ct_select(&self.0, &other.0, choice))
+    }
+}
+
+impl<C: Backend> Generate for Scalar<C> {
+    fn try_generate_from_rng<R: TryCryptoRng + ?Sized>(rng: &mut R) -> Result<Self, R::Error> {
+        Ok(Self::from_uint_unchecked(C::Uint::try_random_mod_vartime(
+            rng,
+            ScalarValue::<Accelerated<C>>::MODULUS.as_nz_ref(),
+        )?))
+    }
+}
+
+impl<C: Backend> Retrieve for Scalar<C> {
+    type Output = C::Uint;
+
+    fn retrieve(&self) -> C::Uint {
+        C::Uint::from(*self)
+    }
+}
+
+impl<C: Backend> From<elliptic_curve::NonZeroScalar<Accelerated<C>>> for Scalar<C> {
+    fn from(nz: elliptic_curve::NonZeroScalar<Accelerated<C>>) -> Self {
+        *nz.as_ref()
+    }
+}
+
+impl<C: Backend> TryFrom<Scalar<C>> for elliptic_curve::NonZeroScalar<Accelerated<C>> {
+    type Error = elliptic_curve::Error;
+
+    fn try_from(scalar: Scalar<C>) -> Result<Self, Self::Error> {
+        Option::from(elliptic_curve::NonZeroScalar::new(scalar)).ok_or(elliptic_curve::Error)
+    }
+}
+
+macro_rules! impl_scalar_mul {
+    ($ty:ty, $self_:ident, $rhs_:ident, $body:expr) => {
+        impl<C: Backend> Mul<$ty> for Scalar<C> {
+            type Output = ProjectivePoint<C>;
+            fn mul($self_, $rhs_: $ty) -> ProjectivePoint<C> {
+                $body
+            }
+        }
+    };
+}
+
+macro_rules! impl_scalar_mulvartime {
+    ($ty:ty, $self_:ident, $rhs_:ident, $body:expr) => {
+        impl<C: Backend> MulVartime<$ty> for Scalar<C> {
+            fn mul_vartime($self_, $rhs_: $ty) -> <Self as Mul<$ty>>::Output {
+                $body
+            }
+        }
+    };
+}
+
+impl_scalar_mul!(AffinePoint<C>, self, rhs, super::mul(&self, &rhs));
+impl_scalar_mul!(&AffinePoint<C>, self, rhs, super::mul(&self, rhs));
+impl_scalar_mul!(ProjectivePoint<C>, self, rhs, super::mul_projective(&self, &rhs));
+impl_scalar_mul!(&ProjectivePoint<C>, self, rhs, super::mul_projective(&self, rhs));
+impl_scalar_mulvartime!(AffinePoint<C>, self, rhs, super::mul(&self, &rhs));
+impl_scalar_mulvartime!(&AffinePoint<C>, self, rhs, super::mul(&self, rhs));
+impl_scalar_mulvartime!(ProjectivePoint<C>, self, rhs, super::mul_projective(&self, &rhs));
+impl_scalar_mulvartime!(&ProjectivePoint<C>, self, rhs, super::mul_projective(&self, rhs));

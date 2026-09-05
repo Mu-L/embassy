@@ -32,23 +32,21 @@ use core::marker::PhantomData;
 use core::ops::Shr;
 
 pub use affine::AffinePoint;
+use elliptic_curve::array::ArraySize;
 use elliptic_curve::ff::{Field, PrimeField};
-#[allow(deprecated)]
-use elliptic_curve::generic_array::ArrayLength;
-use elliptic_curve::group::prime::PrimeCurveAffine;
-use elliptic_curve::group::{self, GroupEncoding};
-use elliptic_curve::ops::{LinearCombination, MulByGenerator, Reduce};
+use elliptic_curve::group::{self, CurveAffine, Group as _, GroupEncoding};
+use elliptic_curve::ops::{LinearCombination, Reduce};
 #[cfg(feature = "pkcs8")]
 use elliptic_curve::pkcs8::{AssociatedOid, ObjectIdentifier};
 use elliptic_curve::point::{DecompactPoint, DecompressPoint, PointCompaction, PointCompression};
-use elliptic_curve::sec1::{CompressedPoint, FromEncodedPoint, ModulusSize, ToCompactEncodedPoint, ToEncodedPoint};
+use elliptic_curve::sec1::{CompressedPoint, FromSec1Point, ModulusSize, ToCompactSec1Point, ToSec1Point};
 use elliptic_curve::subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
-use elliptic_curve::{Curve, CurveArithmetic, FieldBytes, FieldBytesEncoding, PrimeCurve, PrimeCurveArithmetic};
+use elliptic_curve::{Curve, CurveArithmetic, FieldBytes, PrimeCurve, PrimeCurveArithmetic};
 pub use projective::ProjectivePoint;
 pub use scalar::Scalar;
 
 /// SEC1-encoded point of the wrapped curve (identical to the accelerated curve's).
-pub type EncodedPoint<C> = elliptic_curve::sec1::EncodedPoint<C>;
+pub type EncodedPoint<C> = elliptic_curve::sec1::Sec1Point<C>;
 
 /// A RustCrypto curve whose expensive operations can be delegated to a driver.
 ///
@@ -70,20 +68,17 @@ pub trait Backend:
     + PointCompression
     + PointCompaction
     + Curve<
-        FieldBytesSize: ModulusSize<
-            CompressedPointSize: ArrayLength<u8, ArrayType: Copy>,
-            UncompressedPointSize: ArrayLength<u8, ArrayType: Copy>,
-        > + ArrayLength<u8, ArrayType: Copy>,
-        Uint: FieldBytesEncoding<Accelerated<Self>> + From<Scalar<Self>> + for<'a> From<&'a Scalar<Self>>,
+        FieldBytesSize: ModulusSize<CompressedPointSize: ArraySize, UncompressedPointSize: ArraySize> + ArraySize,
+        Uint: From<Scalar<Self>> + for<'a> From<&'a Scalar<Self>>,
     > + CurveArithmetic<
-        Scalar: Ord + From<u32> + From<u128> + Reduce<<Self as Curve>::Uint>,
-        AffinePoint: PrimeCurveAffine<
+        Scalar: Ord + From<u32> + From<u128> + Reduce<<Self as Curve>::Uint> + Reduce<FieldBytes<Self>>,
+        AffinePoint: CurveAffine<
             Curve = <Self as CurveArithmetic>::ProjectivePoint,
             Scalar = <Self as CurveArithmetic>::Scalar,
         > + GroupEncoding<Repr = CompressedPoint<Self>>
-                         + FromEncodedPoint<Self>
-                         + ToEncodedPoint<Self>
-                         + ToCompactEncodedPoint<Self>
+                         + FromSec1Point<Self>
+                         + ToSec1Point<Self>
+                         + ToCompactSec1Point<Self>
                          + DecompressPoint<Self>
                          + DecompactPoint<Self>,
     >
@@ -148,14 +143,8 @@ pub trait Backend:
     /// `ReduceNonZero` natively (e.g. P-256, where it is the
     /// `(w mod (n-1)) + 1` bijection onto the nonzero residues) override this
     /// to use their native implementation unchanged.
-    fn reduce_nonzero(n: Self::Uint) -> Self::Scalar {
+    fn reduce_nonzero(n: &Self::Uint) -> Self::Scalar {
         let reduced = <Self::Scalar as Reduce<Self::Uint>>::reduce(n);
-        Self::Scalar::conditional_select(&reduced, &<Self::Scalar as Field>::ONE, reduced.is_zero())
-    }
-
-    /// Byte-array form of [`reduce_nonzero`](Self::reduce_nonzero).
-    fn reduce_nonzero_bytes(bytes: &FieldBytes<Self>) -> Self::Scalar {
-        let reduced = <Self::Scalar as Reduce<Self::Uint>>::reduce_bytes(bytes);
         Self::Scalar::conditional_select(&reduced, &<Self::Scalar as Field>::ONE, reduced.is_zero())
     }
 
@@ -171,12 +160,16 @@ pub trait Backend:
         x2: &FieldBytes<Self>,
         y2: &FieldBytes<Self>,
     ) -> Option<(FieldBytes<Self>, FieldBytes<Self>)> {
-        let sum = Self::ProjectivePoint::lincomb(
-            &point_from_bytes::<Self>(x1, y1).to_curve(),
-            &scalar_from_bytes::<Self>(k1),
-            &point_from_bytes::<Self>(x2, y2).to_curve(),
-            &scalar_from_bytes::<Self>(k2),
-        );
+        let sum = <Self::ProjectivePoint as LinearCombination<[(Self::ProjectivePoint, Self::Scalar); 2]>>::lincomb(&[
+            (
+                point_from_bytes::<Self>(x1, y1).to_curve(),
+                scalar_from_bytes::<Self>(k1),
+            ),
+            (
+                point_from_bytes::<Self>(x2, y2).to_curve(),
+                scalar_from_bytes::<Self>(k2),
+            ),
+        ]);
 
         (!bool::from(group::Group::is_identity(&sum))).then(|| point_to_bytes::<Self>(&group::Curve::to_affine(&sum)))
     }
@@ -234,7 +227,7 @@ impl<C: Backend> Curve for Accelerated<C> {
     type FieldBytesSize = C::FieldBytesSize;
     type Uint = C::Uint;
 
-    const ORDER: C::Uint = C::ORDER;
+    const ORDER: elliptic_curve::bigint::Odd<C::Uint> = C::ORDER;
 }
 
 impl<C: Backend> PrimeCurve for Accelerated<C> {}
@@ -268,22 +261,17 @@ impl<C: Backend + AssociatedOid> AssociatedOid for Accelerated<C> {
 /// ECDSA over an accelerated curve.
 #[cfg(feature = "ecdsa")]
 mod ecdsa_impls {
-    use ecdsa::SignatureSize;
-    use ecdsa::hazmat::{DigestPrimitive, SignPrimitive, VerifyPrimitive};
-    #[allow(deprecated)]
-    use elliptic_curve::generic_array::ArrayLength;
+    use ecdsa::{DigestAlgorithm, EcdsaCurve};
 
-    use super::{Accelerated, AffinePoint, Backend, Scalar};
+    use super::{Accelerated, Backend};
 
-    impl<C: Backend + DigestPrimitive> DigestPrimitive for Accelerated<C> {
-        type Digest = C::Digest;
+    impl<C: Backend + EcdsaCurve> EcdsaCurve for Accelerated<C> {
+        const NORMALIZE_S: bool = C::NORMALIZE_S;
     }
 
-    #[allow(deprecated)]
-    impl<C: Backend> SignPrimitive<Accelerated<C>> for Scalar<C> where SignatureSize<Accelerated<C>>: ArrayLength<u8> {}
-
-    #[allow(deprecated)]
-    impl<C: Backend> VerifyPrimitive<Accelerated<C>> for AffinePoint<C> where SignatureSize<Accelerated<C>>: ArrayLength<u8> {}
+    impl<C: Backend + DigestAlgorithm> DigestAlgorithm for Accelerated<C> {
+        type Digest = C::Digest;
+    }
 }
 
 // ===========================================================================
@@ -382,12 +370,12 @@ fn lincomb<C: Backend>(
         return if C::ACCELERATED_MUL {
             (*p1 * k1) + (*p2 * k2)
         } else {
-            ProjectivePoint::from_projective(C::ProjectivePoint::lincomb(
-                &p1.projective(),
-                &k1.0,
-                &p2.projective(),
-                &k2.0,
-            ))
+            ProjectivePoint::from_projective(<C::ProjectivePoint as LinearCombination<
+                [(C::ProjectivePoint, C::Scalar); 2],
+            >>::lincomb(&[
+                (p1.projective(), k1.0),
+                (p2.projective(), k2.0),
+            ]))
         };
     }
 
@@ -423,7 +411,7 @@ fn scalar_from_bytes<C: Backend>(k: &FieldBytes<C>) -> C::Scalar {
 
 /// `p` must not be the identity.
 fn point_to_bytes<C: Backend>(p: &C::AffinePoint) -> (FieldBytes<C>, FieldBytes<C>) {
-    let encoded = p.to_encoded_point(false);
+    let encoded = p.to_sec1_point(false);
 
     // Only the identity encodes without coordinates, and the callers
     // never pass the identity.
@@ -459,7 +447,7 @@ fn point_from_driver<C: Backend>(x: FieldBytes<C>, y: FieldBytes<C>) -> Projecti
 fn point_to_bytes_or_identity<C: Backend>(point: &C::ProjectivePoint) -> (FieldBytes<C>, FieldBytes<C>) {
     let affine = group::Curve::to_affine(point);
 
-    if bool::from(PrimeCurveAffine::is_identity(&affine)) {
+    if bool::from(CurveAffine::is_identity(&affine)) {
         (FieldBytes::<C>::default(), FieldBytes::<C>::default())
     } else {
         point_to_bytes::<C>(&affine)
@@ -481,7 +469,7 @@ fn point_to_bytes_or_identity<C: Backend>(point: &C::ProjectivePoint) -> (FieldB
 fn point_from_driver_bytes<C: Backend>(x: &FieldBytes<C>, y: &FieldBytes<C>) -> C::AffinePoint {
     let encoded = EncodedPoint::<C>::from_affine_coordinates(x, y, false);
 
-    C::AffinePoint::from_encoded_point(&encoded).expect("driver returned an invalid point")
+    C::AffinePoint::from_sec1_point(&encoded).expect("driver returned an invalid point")
 }
 
 /// Decode point coordinates for a software operation. Callers never pass the
@@ -489,7 +477,7 @@ fn point_from_driver_bytes<C: Backend>(x: &FieldBytes<C>, y: &FieldBytes<C>) -> 
 fn point_from_bytes<C: Backend>(x: &FieldBytes<C>, y: &FieldBytes<C>) -> C::AffinePoint {
     let encoded = EncodedPoint::<C>::from_affine_coordinates(x, y, false);
 
-    C::AffinePoint::from_encoded_point(&encoded).expect("invalid point")
+    C::AffinePoint::from_sec1_point(&encoded).expect("invalid point")
 }
 
 #[allow(dead_code)]

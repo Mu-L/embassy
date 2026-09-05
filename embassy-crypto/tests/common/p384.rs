@@ -10,13 +10,12 @@
 #![allow(clippy::op_ref)]
 
 use embassy_crypto::p384 as hw;
+use p384::elliptic_curve::common::Generate;
 use p384::elliptic_curve::ecdh;
 use p384::elliptic_curve::ff::{Field, PrimeField};
-use p384::elliptic_curve::group::prime::PrimeCurveAffine;
-use p384::elliptic_curve::group::{Curve, Group, GroupEncoding};
-use p384::elliptic_curve::ops::{LinearCombination, MulByGenerator};
-use p384::elliptic_curve::sec1::ToEncodedPoint;
-use rand_core::OsRng;
+use p384::elliptic_curve::group::{Curve, CurveAffine, Group, GroupEncoding};
+use p384::elliptic_curve::ops::LinearCombination;
+use p384::elliptic_curve::sec1::ToSec1Point;
 
 fn hex48(s: &str) -> p384::FieldBytes {
     let mut out = [0u8; 48];
@@ -31,18 +30,18 @@ fn sw_scalar(k: &hw::Scalar) -> p384::Scalar {
 }
 
 fn hw_point_bytes(p: &hw::ProjectivePoint) -> Vec<u8> {
-    p.to_affine().to_encoded_point(false).as_bytes().to_vec()
+    p.to_affine().to_sec1_point(false).as_bytes().to_vec()
 }
 
 fn sw_point_bytes(p: &p384::ProjectivePoint) -> Vec<u8> {
-    p.to_affine().to_encoded_point(false).as_bytes().to_vec()
+    p.to_affine().to_sec1_point(false).as_bytes().to_vec()
 }
 
 #[test]
 fn generator_matches_sec2() {
     // SEC 2 (secp384r1) base point: a fixed answer independent of `p384`.
     let g = hw::ProjectivePoint::GENERATOR.to_affine();
-    let encoded = g.to_encoded_point(false);
+    let encoded = g.to_sec1_point(false);
 
     assert_eq!(
         encoded.x().unwrap(),
@@ -64,8 +63,8 @@ fn generator_matches_sec2() {
 #[test]
 fn scalar_mul_matches_p384() {
     for _ in 0..4 {
-        let k = hw::Scalar::random(&mut OsRng);
-        let l = hw::Scalar::random(&mut OsRng);
+        let k = hw::Scalar::random(&mut rand::rng());
+        let l = hw::Scalar::random(&mut rand::rng());
         let (sk, sl) = (sw_scalar(&k), sw_scalar(&l));
 
         // k * G, through every entry point.
@@ -85,25 +84,21 @@ fn scalar_mul_matches_p384() {
         let sp = p384::ProjectivePoint::GENERATOR * sl;
         assert_eq!(hw_point_bytes(&(p * k)), sw_point_bytes(&(sp * sk)));
         assert_eq!(
-            hw_point_bytes(&hw::ProjectivePoint::lincomb(
-                &p,
-                &k,
-                &hw::ProjectivePoint::GENERATOR,
-                &l
-            )),
-            sw_point_bytes(&p384::ProjectivePoint::lincomb(
-                &sp,
-                &sk,
-                &p384::ProjectivePoint::GENERATOR,
-                &sl
-            ))
+            hw_point_bytes(&hw::ProjectivePoint::lincomb(&[
+                (p, k),
+                (hw::ProjectivePoint::GENERATOR, l)
+            ],)),
+            sw_point_bytes(&p384::ProjectivePoint::lincomb(&[
+                (sp, sk),
+                (p384::ProjectivePoint::GENERATOR, sl)
+            ],))
         );
     }
 }
 
 #[test]
 fn degenerate_operands() {
-    let k = hw::Scalar::random(&mut OsRng);
+    let k = hw::Scalar::random(&mut rand::rng());
     let p = hw::ProjectivePoint::GENERATOR * k;
 
     // Zero scalars and identity points contribute the identity.
@@ -128,7 +123,7 @@ fn degenerate_operands() {
 
 #[test]
 fn point_arithmetic_and_encoding() {
-    let k = hw::Scalar::random(&mut OsRng);
+    let k = hw::Scalar::random(&mut rand::rng());
     let p = hw::ProjectivePoint::GENERATOR * k;
     let a = p.to_affine();
 
@@ -146,8 +141,8 @@ fn point_arithmetic_and_encoding() {
 
 #[test]
 fn scalar_field_matches_p384() {
-    let a = hw::Scalar::random(&mut OsRng);
-    let b = hw::Scalar::random(&mut OsRng);
+    let a = hw::Scalar::random(&mut rand::rng());
+    let b = hw::Scalar::random(&mut rand::rng());
     let (sa, sb) = (sw_scalar(&a), sw_scalar(&b));
 
     assert_eq!(sw_scalar(&(a + b)), sa + sb);
@@ -161,8 +156,8 @@ fn scalar_field_matches_p384() {
 
 #[test]
 fn ecdh_matches_p384() {
-    let alice = hw::SecretKey::random(&mut OsRng);
-    let bob = hw::SecretKey::random(&mut OsRng);
+    let alice: hw::SecretKey = Generate::generate_from_rng(&mut rand::rng());
+    let bob: hw::SecretKey = Generate::generate_from_rng(&mut rand::rng());
 
     let hw_shared = ecdh::diffie_hellman(alice.to_nonzero_scalar(), bob.public_key().as_affine());
     let hw_shared_rev = ecdh::diffie_hellman(bob.to_nonzero_scalar(), alice.public_key().as_affine());
@@ -172,8 +167,8 @@ fn ecdh_matches_p384() {
     let sw_alice = p384::SecretKey::from_bytes(&alice.to_bytes()).unwrap();
     let sw_bob = p384::SecretKey::from_bytes(&bob.to_bytes()).unwrap();
     assert_eq!(
-        alice.public_key().to_encoded_point(false).as_bytes(),
-        sw_alice.public_key().to_encoded_point(false).as_bytes()
+        alice.public_key().to_sec1_point(false).as_bytes(),
+        sw_alice.public_key().to_sec1_point(false).as_bytes()
     );
     let sw_shared = ecdh::diffie_hellman(sw_alice.to_nonzero_scalar(), sw_bob.public_key().as_affine());
     assert_eq!(hw_shared.raw_secret_bytes(), sw_shared.raw_secret_bytes());
@@ -185,7 +180,7 @@ fn ecdsa_interoperates_with_p384() {
 
     let msg = b"embassy-crypto p384";
 
-    let hw_signing = hw::ecdsa::SigningKey::random(&mut OsRng);
+    let hw_signing: hw::ecdsa::SigningKey = Generate::generate_from_rng(&mut rand::rng());
     let sw_signing = p384::ecdsa::SigningKey::from_bytes(&hw_signing.to_bytes()).unwrap();
 
     // Deterministic (RFC 6979) signatures, so the two must agree bit for bit.
@@ -195,8 +190,7 @@ fn ecdsa_interoperates_with_p384() {
 
     // Cross-verification.
     let hw_verifying =
-        hw::ecdsa::VerifyingKey::from_sec1_bytes(sw_signing.verifying_key().to_encoded_point(false).as_bytes())
-            .unwrap();
+        hw::ecdsa::VerifyingKey::from_sec1_bytes(sw_signing.verifying_key().to_sec1_point(false).as_bytes()).unwrap();
     hw_verifying.verify(msg, &hw_sig).unwrap();
     sw_signing.verifying_key().verify(msg, &sw_sig).unwrap();
     assert!(hw_verifying.verify(b"other", &hw_sig).is_err());

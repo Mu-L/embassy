@@ -1227,8 +1227,7 @@ struct P256EcDriver;
 
 #[cfg(feature = "driver-p256-ec")]
 fn field_bytes(bytes: &[u8; 32]) -> p256::FieldBytes {
-    #[allow(deprecated)]
-    p256::FieldBytes::from_slice(bytes).clone()
+    p256::FieldBytes::try_from(&bytes[..]).expect("slice is 32 bytes long")
 }
 
 #[cfg(feature = "driver-p256-ec")]
@@ -1241,15 +1240,6 @@ fn sec1(p: &embassy_crypto_driver::P256AffinePoint) -> [u8; 65] {
 }
 
 #[cfg(feature = "driver-p256-ec")]
-fn scalar(bytes: &[u8; 32]) -> Result<p256::Scalar, CryptoError> {
-    if bytes.iter().all(|&b| b == 0) {
-        return Err(CryptoError::InvalidKey);
-    }
-    use p256::elliptic_curve::PrimeField;
-    Option::<p256::Scalar>::from(p256::Scalar::from_repr(field_bytes(bytes))).ok_or(CryptoError::InvalidKey)
-}
-
-#[cfg(feature = "driver-p256-ec")]
 fn nonzero_scalar(bytes: &[u8; 32]) -> Result<p256::NonZeroScalar, CryptoError> {
     use p256::elliptic_curve::PrimeField;
     // from_repr rejects >= n; NonZeroScalar::new rejects zero.
@@ -1259,8 +1249,8 @@ fn nonzero_scalar(bytes: &[u8; 32]) -> Result<p256::NonZeroScalar, CryptoError> 
 
 #[cfg(feature = "driver-p256-ec")]
 fn point_xy(sk: &p256::SecretKey) -> ([u8; 32], [u8; 32]) {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    let ep = sk.public_key().to_encoded_point(false);
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    let ep = sk.public_key().to_sec1_point(false);
     let mut x = [0u8; 32];
     let mut y = [0u8; 32];
     x.copy_from_slice(ep.x().unwrap());
@@ -1319,20 +1309,17 @@ impl embassy_crypto_driver::P256Ec for P256EcDriver {
         digest: &[u8; 32],
         rng: &mut dyn embassy_crypto_driver::Rng,
     ) -> Result<embassy_crypto_driver::P256Signature, CryptoError> {
-        use ecdsa::hazmat::SignPrimitive;
-        let d = scalar(&k.0)?;
+        let d = nonzero_scalar(&k.0)?;
         let mut nb = [0u8; 32];
         let nonce = loop {
             rng.rng_fill(&mut nb).map_err(|_| CryptoError::HardwareError)?;
-            if let Ok(n) = scalar(&nb) {
+            if let Ok(n) = nonzero_scalar(&nb) {
                 break n;
             }
         };
-        let prehash = field_bytes(digest);
-        let (sig, _rid) = d
-            .try_sign_prehashed(nonce, &prehash)
+        let (sig, _rid) = ecdsa::hazmat::sign_prehashed::<p256::NistP256>(&d, &nonce, digest)
             .map_err(|_| CryptoError::InvalidSignature)?;
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
         r.copy_from_slice(&sig.r().to_bytes());
         s.copy_from_slice(&sig.s().to_bytes());

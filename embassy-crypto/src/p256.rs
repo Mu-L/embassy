@@ -1,6 +1,5 @@
 //! NIST P-256 (secp256r1), accelerated.
 
-use elliptic_curve::FieldBytesEncoding;
 use elliptic_curve::bigint::U256;
 use p256::elliptic_curve;
 
@@ -25,7 +24,7 @@ pub type BlindedScalar = elliptic_curve::scalar::BlindedScalar<NistP256>;
 pub type CompressedPoint = elliptic_curve::sec1::CompressedPoint<NistP256>;
 
 /// SEC1-encoded P-256 curve point.
-pub type EncodedPoint = elliptic_curve::sec1::EncodedPoint<NistP256>;
+pub type Sec1Point = elliptic_curve::sec1::Sec1Point<NistP256>;
 
 /// Byte array containing a serialized field element value (base field or scalar).
 pub type FieldBytes = elliptic_curve::FieldBytes<NistP256>;
@@ -52,16 +51,6 @@ pub mod ecdsa {
 
     /// ECDSA/P-256 verification key (i.e. public key).
     pub type VerifyingKey = ecdsa::VerifyingKey<NistP256>;
-}
-
-impl FieldBytesEncoding<NistP256> for U256 {
-    fn decode_field_bytes(field_bytes: &FieldBytes) -> Self {
-        <U256 as FieldBytesEncoding<p256::NistP256>>::decode_field_bytes(field_bytes)
-    }
-
-    fn encode_field_bytes(&self) -> FieldBytes {
-        <U256 as FieldBytesEncoding<p256::NistP256>>::encode_field_bytes(self)
-    }
 }
 
 impl From<Scalar> for U256 {
@@ -126,16 +115,10 @@ impl Backend for p256::NistP256 {
     // Keep p256's native `ReduceNonZero`: it computes the `(w mod (n-1)) + 1`
     // bijection onto the nonzero residues, which the `Reduce`-based backend
     // default (reduce, remapping zero to one) does not reproduce.
-    fn reduce_nonzero(n: U256) -> p256::Scalar {
+    fn reduce_nonzero(n: &U256) -> p256::Scalar {
         use elliptic_curve::ops::ReduceNonZero;
 
         <p256::Scalar as ReduceNonZero<U256>>::reduce_nonzero(n)
-    }
-
-    fn reduce_nonzero_bytes(bytes: &FieldBytes) -> p256::Scalar {
-        use elliptic_curve::ops::ReduceNonZero;
-
-        <p256::Scalar as ReduceNonZero<U256>>::reduce_nonzero_bytes(bytes)
     }
 
     #[cfg(not(feature = "driver-p256-lincomb"))]

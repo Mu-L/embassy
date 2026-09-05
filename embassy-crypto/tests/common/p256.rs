@@ -5,13 +5,12 @@
 #![allow(clippy::op_ref)]
 
 use embassy_crypto::p256 as hw;
+use p256::elliptic_curve::common::Generate;
 use p256::elliptic_curve::ecdh;
 use p256::elliptic_curve::ff::{Field, PrimeField};
-use p256::elliptic_curve::group::prime::PrimeCurveAffine;
-use p256::elliptic_curve::group::{Curve, Group, GroupEncoding};
-use p256::elliptic_curve::ops::{LinearCombination, MulByGenerator};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
-use rand_core::OsRng;
+use p256::elliptic_curve::group::{Curve, CurveAffine, Group, GroupEncoding};
+use p256::elliptic_curve::ops::LinearCombination;
+use p256::elliptic_curve::sec1::ToSec1Point;
 
 fn hex32(s: &str) -> p256::FieldBytes {
     let mut out = [0u8; 32];
@@ -26,11 +25,11 @@ fn sw_scalar(k: &hw::Scalar) -> p256::Scalar {
 }
 
 fn hw_point_bytes(p: &hw::ProjectivePoint) -> Vec<u8> {
-    p.to_affine().to_encoded_point(false).as_bytes().to_vec()
+    p.to_affine().to_sec1_point(false).as_bytes().to_vec()
 }
 
 fn sw_point_bytes(p: &p256::ProjectivePoint) -> Vec<u8> {
-    p.to_affine().to_encoded_point(false).as_bytes().to_vec()
+    p.to_affine().to_sec1_point(false).as_bytes().to_vec()
 }
 
 #[test]
@@ -42,7 +41,7 @@ fn known_answer() {
     .unwrap();
 
     let kg = hw::ProjectivePoint::mul_by_generator(&k).to_affine();
-    let encoded = kg.to_encoded_point(false);
+    let encoded = kg.to_sec1_point(false);
 
     assert_eq!(
         encoded.x().unwrap(),
@@ -57,8 +56,8 @@ fn known_answer() {
 #[test]
 fn scalar_mul_matches_p256() {
     for _ in 0..16 {
-        let k = hw::Scalar::random(&mut OsRng);
-        let l = hw::Scalar::random(&mut OsRng);
+        let k = hw::Scalar::random(&mut rand::rng());
+        let l = hw::Scalar::random(&mut rand::rng());
         let (sk, sl) = (sw_scalar(&k), sw_scalar(&l));
 
         // k * G, through every entry point that routes to the driver.
@@ -78,25 +77,21 @@ fn scalar_mul_matches_p256() {
         let sp = p256::ProjectivePoint::GENERATOR * sl;
         assert_eq!(hw_point_bytes(&(p * k)), sw_point_bytes(&(sp * sk)));
         assert_eq!(
-            hw_point_bytes(&hw::ProjectivePoint::lincomb(
-                &p,
-                &k,
-                &hw::ProjectivePoint::GENERATOR,
-                &l
-            )),
-            sw_point_bytes(&p256::ProjectivePoint::lincomb(
-                &sp,
-                &sk,
-                &p256::ProjectivePoint::GENERATOR,
-                &sl
-            ))
+            hw_point_bytes(&hw::ProjectivePoint::lincomb(&[
+                (p, k),
+                (hw::ProjectivePoint::GENERATOR, l)
+            ],)),
+            sw_point_bytes(&p256::ProjectivePoint::lincomb(&[
+                (sp, sk),
+                (p256::ProjectivePoint::GENERATOR, sl)
+            ],))
         );
     }
 }
 
 #[test]
 fn degenerate_operands() {
-    let k = hw::Scalar::random(&mut OsRng);
+    let k = hw::Scalar::random(&mut rand::rng());
     let p = hw::ProjectivePoint::GENERATOR * k;
 
     // Zero scalars and identity points contribute the identity — through the
@@ -123,7 +118,7 @@ fn degenerate_operands() {
 
 #[test]
 fn point_arithmetic_and_encoding() {
-    let k = hw::Scalar::random(&mut OsRng);
+    let k = hw::Scalar::random(&mut rand::rng());
     let p = hw::ProjectivePoint::GENERATOR * k;
     let a = p.to_affine();
 
@@ -151,7 +146,7 @@ fn point_size_stays_close_to_p256() {
 fn affine_form_matches_p256() {
     use p256::elliptic_curve::subtle::{Choice, ConditionallySelectable};
 
-    let k = hw::Scalar::random(&mut OsRng);
+    let k = hw::Scalar::random(&mut rand::rng());
     let sk = sw_scalar(&k);
 
     // Points whose affine form is cached (driver results, affine input,
@@ -183,8 +178,8 @@ fn affine_form_matches_p256() {
         assert_eq!(hw_point_bytes(&hw_point), sw_point_bytes(&sw_point));
         assert_eq!(hw_point.to_bytes(), sw_point.to_bytes());
         assert_eq!(
-            hw::AffinePoint::from(hw_point).to_encoded_point(false),
-            sw_point.to_encoded_point(false)
+            hw::AffinePoint::from(hw_point).to_sec1_point(false),
+            sw_point.to_sec1_point(false)
         );
     }
 
@@ -195,8 +190,8 @@ fn affine_form_matches_p256() {
 
 #[test]
 fn scalar_field_matches_p256() {
-    let a = hw::Scalar::random(&mut OsRng);
-    let b = hw::Scalar::random(&mut OsRng);
+    let a = hw::Scalar::random(&mut rand::rng());
+    let b = hw::Scalar::random(&mut rand::rng());
     let (sa, sb) = (sw_scalar(&a), sw_scalar(&b));
 
     assert_eq!(sw_scalar(&(a + b)), sa + sb);
@@ -210,8 +205,8 @@ fn scalar_field_matches_p256() {
 
 #[test]
 fn ecdh_matches_p256() {
-    let alice = hw::SecretKey::random(&mut OsRng);
-    let bob = hw::SecretKey::random(&mut OsRng);
+    let alice: hw::SecretKey = Generate::generate_from_rng(&mut rand::rng());
+    let bob: hw::SecretKey = Generate::generate_from_rng(&mut rand::rng());
 
     let hw_shared = ecdh::diffie_hellman(alice.to_nonzero_scalar(), bob.public_key().as_affine());
     let hw_shared_rev = ecdh::diffie_hellman(bob.to_nonzero_scalar(), alice.public_key().as_affine());
@@ -221,8 +216,8 @@ fn ecdh_matches_p256() {
     let sw_alice = p256::SecretKey::from_bytes(&alice.to_bytes()).unwrap();
     let sw_bob = p256::SecretKey::from_bytes(&bob.to_bytes()).unwrap();
     assert_eq!(
-        alice.public_key().to_encoded_point(false),
-        sw_alice.public_key().to_encoded_point(false)
+        alice.public_key().to_sec1_point(false),
+        sw_alice.public_key().to_sec1_point(false)
     );
     let sw_shared = ecdh::diffie_hellman(sw_alice.to_nonzero_scalar(), sw_bob.public_key().as_affine());
     assert_eq!(hw_shared.raw_secret_bytes(), sw_shared.raw_secret_bytes());
@@ -234,7 +229,7 @@ fn ecdsa_interoperates_with_p256() {
 
     let msg = b"embassy-crypto p256";
 
-    let hw_signing = hw::ecdsa::SigningKey::random(&mut OsRng);
+    let hw_signing: hw::ecdsa::SigningKey = Generate::generate_from_rng(&mut rand::rng());
     let sw_signing = p256::ecdsa::SigningKey::from_bytes(&hw_signing.to_bytes()).unwrap();
 
     // Deterministic (RFC 6979) signatures, so the two must agree bit for bit.
@@ -244,8 +239,7 @@ fn ecdsa_interoperates_with_p256() {
 
     // Cross-verification.
     let hw_verifying =
-        hw::ecdsa::VerifyingKey::from_sec1_bytes(sw_signing.verifying_key().to_encoded_point(false).as_bytes())
-            .unwrap();
+        hw::ecdsa::VerifyingKey::from_sec1_bytes(sw_signing.verifying_key().to_sec1_point(false).as_bytes()).unwrap();
     hw_verifying.verify(msg, &hw_sig).unwrap();
     sw_signing.verifying_key().verify(msg, &sw_sig).unwrap();
     assert!(hw_verifying.verify(b"other", &hw_sig).is_err());

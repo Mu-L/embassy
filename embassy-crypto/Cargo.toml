@@ -34,7 +34,7 @@ crypto-common = "0.2"
 cipher = { version = "0.5", default-features = false }
 aead = { version = "0.6", default-features = false }
 generic-array = "1.4.5"
-heapless = "0.8"
+heapless = "0.9"
 
 # RustCrypto software-driver dependencies (all optional)
 md-5 = { version = "0.11", default-features = false, optional = true }
@@ -51,18 +51,18 @@ cmac = { version = "0.8", default-features = false, optional = true }
 # P-256: software arithmetic wrapped by the `p256` module (scalar
 # multiplication is delegated to the `P256ScalarMul` driver), and the
 # software fallback driver for that unitrait.
-elliptic-curve = { version = "0.13", default-features = false, features = ["arithmetic", "sec1"], optional = true }
-p256 = { version = "0.13", default-features = false, features = ["arithmetic"], optional = true }
-ecdsa = { version = "0.16", default-features = false, features = ["signing", "verifying", "digest", "hazmat"], optional = true }
+elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1"], optional = true }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic"], optional = true }
+ecdsa = { version = "0.17", default-features = false, features = ["digest", "algorithm"], optional = true }
 
 # P-384: software arithmetic wrapped by the `p384` module. Pure software for
 # now: there are no P-384 driver traits yet.
-p384 = { version = "0.13", default-features = false, features = ["arithmetic"], optional = true }
+p384 = { version = "0.14", default-features = false, features = ["arithmetic"], optional = true }
 
 [dev-dependencies]
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "ecdh"] }
-p384 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "ecdh", "pkcs8"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "ecdh"] }
+p384 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "ecdh", "pkcs8"] }
+rand = { version = "0.10", default-features = false, features = ["thread_rng", "std_rng", "sys_rng"] }
 
 [features]
 defmt = ["embassy-crypto-driver/defmt"]

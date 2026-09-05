@@ -12,13 +12,15 @@ use core::fmt;
 use core::iter::Sum;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
+use elliptic_curve::bigint::ctutils::{CtEq, CtSelect};
+use elliptic_curve::common::Generate;
 use elliptic_curve::group::cofactor::CofactorGroup;
-use elliptic_curve::group::prime::{PrimeCurve, PrimeCurveAffine, PrimeGroup};
-use elliptic_curve::group::{self, Group, GroupEncoding};
-use elliptic_curve::ops::{LinearCombination, MulByGenerator};
-use elliptic_curve::point::Double;
-use elliptic_curve::rand_core::RngCore;
-use elliptic_curve::sec1::{CompressedPoint, FromEncodedPoint, ToEncodedPoint};
+use elliptic_curve::group::prime::{PrimeCurve, PrimeGroup};
+use elliptic_curve::group::{self, CurveAffine, Group, GroupEncoding};
+use elliptic_curve::ops::{Double, LinearCombination, MulByGeneratorVartime, MulVartime};
+use elliptic_curve::point::NonIdentity;
+use elliptic_curve::rand_core::TryRng;
+use elliptic_curve::sec1::{CompressedPoint, FromSec1Point, ToSec1Point};
 use elliptic_curve::subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 use elliptic_curve::zeroize::DefaultIsZeroes;
 use elliptic_curve::{Error, PublicKey};
@@ -134,7 +136,7 @@ impl<C: Backend> ConditionallySelectable for ProjectivePoint<C> {
 
 impl<C: Backend> ConstantTimeEq for ProjectivePoint<C> {
     fn ct_eq(&self, other: &Self) -> Choice {
-        self.projective().ct_eq(&other.projective())
+        ConstantTimeEq::ct_eq(&self.projective(), &other.projective())
     }
 }
 
@@ -170,15 +172,18 @@ impl<C: Backend> From<&PublicKey<Accelerated<C>>> for ProjectivePoint<C> {
     }
 }
 
-impl<C: Backend> FromEncodedPoint<Accelerated<C>> for ProjectivePoint<C> {
-    fn from_encoded_point(point: &EncodedPoint<C>) -> CtOption<Self> {
-        <C::AffinePoint as FromEncodedPoint<C>>::from_encoded_point(point).map(Self::from_affine)
+impl<C: Backend> FromSec1Point<Accelerated<C>> for ProjectivePoint<C> {
+    fn from_sec1_point(point: &EncodedPoint<Accelerated<C>>) -> elliptic_curve::bigint::CtOption<Self> {
+        let point = EncodedPoint::<C>::from_bytes(point.as_bytes()).expect("same size encoding");
+        <C::AffinePoint as FromSec1Point<C>>::from_sec1_point(&point)
+            .map(Self::from_affine)
+            .into()
     }
 }
 
-impl<C: Backend> ToEncodedPoint<Accelerated<C>> for ProjectivePoint<C> {
-    fn to_encoded_point(&self, compress: bool) -> EncodedPoint<C> {
-        <C::AffinePoint as ToEncodedPoint<C>>::to_encoded_point(&self.affine(), compress)
+impl<C: Backend> ToSec1Point<Accelerated<C>> for ProjectivePoint<C> {
+    fn to_sec1_point(&self, compress: bool) -> EncodedPoint<C> {
+        <C::AffinePoint as ToSec1Point<C>>::to_sec1_point(&self.affine(), compress)
     }
 }
 
@@ -186,8 +191,12 @@ impl<C: Backend> Group for ProjectivePoint<C> {
     type Scalar = Scalar<C>;
 
     /// A random point, computed as `k * G` for a random scalar `k`, via the driver.
-    fn random(rng: impl RngCore) -> Self {
-        Self::mul_by_generator(&<Scalar<C> as elliptic_curve::ff::Field>::random(rng))
+    fn try_random<R: TryRng + ?Sized>(rng: &mut R) -> Result<Self, R::Error> {
+        C::ProjectivePoint::try_random(rng).map(Self::from_projective)
+    }
+
+    fn mul_by_generator(scalar: &Scalar<C>) -> Self {
+        super::mul_base(scalar)
     }
 
     fn identity() -> Self {
@@ -201,7 +210,7 @@ impl<C: Backend> Group for ProjectivePoint<C> {
     fn is_identity(&self) -> Choice {
         match self.0 {
             Repr::Projective(point) => Group::is_identity(&point),
-            Repr::Affine(point) => PrimeCurveAffine::is_identity(&point),
+            Repr::Affine(point) => CurveAffine::is_identity(&point),
         }
     }
 
@@ -227,7 +236,7 @@ impl<C: Backend> GroupEncoding for ProjectivePoint<C> {
 }
 
 impl<C: Backend> group::Curve for ProjectivePoint<C> {
-    type AffineRepr = AffinePoint<C>;
+    type Affine = AffinePoint<C>;
 
     fn to_affine(&self) -> AffinePoint<C> {
         AffinePoint(self.affine())
@@ -236,24 +245,44 @@ impl<C: Backend> group::Curve for ProjectivePoint<C> {
 
 /// Two-term linear combination `x * k + y * l`, via the driver when it
 /// provides one.
-impl<C: Backend> LinearCombination for ProjectivePoint<C> {
-    fn lincomb(x: &Self, k: &Scalar<C>, y: &Self, l: &Scalar<C>) -> Self {
-        super::lincomb(x, k, y, l)
+impl<C: Backend> LinearCombination<[(Self, Scalar<C>); 2]> for ProjectivePoint<C> {
+    fn lincomb(points_and_scalars: &[(Self, Scalar<C>); 2]) -> Self {
+        super::lincomb(
+            &points_and_scalars[0].0,
+            &points_and_scalars[0].1,
+            &points_and_scalars[1].0,
+            &points_and_scalars[1].1,
+        )
     }
 }
 
 /// Scalar multiplication by the generator, via the driver.
-impl<C: Backend> MulByGenerator for ProjectivePoint<C> {
-    fn mul_by_generator(scalar: &Scalar<C>) -> Self {
+impl<C: Backend> MulByGeneratorVartime for ProjectivePoint<C> {
+    fn mul_by_generator_vartime(scalar: &Scalar<C>) -> Self {
         super::mul_base(scalar)
+    }
+
+    fn mul_by_generator_and_mul_add_vartime(a: &Scalar<C>, b: &Scalar<C>, p: &Self) -> Self {
+        super::lincomb(&ProjectivePoint::GENERATOR, a, p, b)
+    }
+}
+
+/// Variable-time scalar multiplication, via the driver.
+impl<C: Backend> MulVartime<&Scalar<C>> for ProjectivePoint<C> {
+    fn mul_vartime(self, rhs: &Scalar<C>) -> Self {
+        super::mul_projective(rhs, &self)
+    }
+}
+
+impl<C: Backend> MulVartime<Scalar<C>> for ProjectivePoint<C> {
+    fn mul_vartime(self, rhs: Scalar<C>) -> Self {
+        super::mul_projective(&rhs, &self)
     }
 }
 
 impl<C: Backend> PrimeGroup for ProjectivePoint<C> {}
 
-impl<C: Backend> PrimeCurve for ProjectivePoint<C> {
-    type Affine = AffinePoint<C>;
-}
+impl<C: Backend> PrimeCurve for ProjectivePoint<C> {}
 
 impl<C: Backend> TryFrom<ProjectivePoint<C>> for PublicKey<Accelerated<C>> {
     type Error = Error;
@@ -475,5 +504,41 @@ impl<C: Backend> Neg for &ProjectivePoint<C> {
 
     fn neg(self) -> ProjectivePoint<C> {
         -*self
+    }
+}
+
+impl<C: Backend> LinearCombination<[(Self, Scalar<C>)]> for ProjectivePoint<C> {}
+
+impl<C: Backend> CtEq for ProjectivePoint<C> {
+    fn ct_eq(&self, other: &Self) -> elliptic_curve::bigint::Choice {
+        CtEq::ct_eq(&self.projective(), &other.projective())
+    }
+}
+
+impl<C: Backend> CtSelect for ProjectivePoint<C> {
+    fn ct_select(&self, other: &Self, choice: elliptic_curve::bigint::Choice) -> Self {
+        Self::from_projective(CtSelect::ct_select(&self.projective(), &other.projective(), choice))
+    }
+}
+
+impl<C: Backend> Generate for ProjectivePoint<C> {
+    fn try_generate_from_rng<R: elliptic_curve::rand_core::TryCryptoRng + ?Sized>(
+        rng: &mut R,
+    ) -> Result<Self, R::Error> {
+        C::ProjectivePoint::try_generate_from_rng(rng).map(Self::from_projective)
+    }
+}
+
+impl<C: Backend> From<NonIdentity<Self>> for ProjectivePoint<C> {
+    fn from(nid: NonIdentity<Self>) -> Self {
+        nid.to_point()
+    }
+}
+
+impl<C: Backend> TryFrom<ProjectivePoint<C>> for NonIdentity<ProjectivePoint<C>> {
+    type Error = elliptic_curve::Error;
+
+    fn try_from(point: ProjectivePoint<C>) -> Result<Self, Self::Error> {
+        Option::from(NonIdentity::new(point)).ok_or(elliptic_curve::Error)
     }
 }

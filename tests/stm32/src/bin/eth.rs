@@ -124,7 +124,7 @@ async fn main(spawner: Spawner) {
             #[cfg(not(feature = "stm32h755zi"))]
             updown_kbps: 1000,
             #[cfg(feature = "stm32h755zi")]
-            updown_kbps: 800,
+            updown_kbps: 500,
         },
     )
     .await;
